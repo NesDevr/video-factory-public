@@ -1,0 +1,1191 @@
+"""Unified Google AI client, fixture cache, and per-run AI tracing."""
+
+from __future__ import annotations
+
+import hashlib
+import html
+import itertools
+import json
+import logging
+import re
+import shutil
+import time
+import wave
+from dataclasses import dataclass
+from datetime import datetime
+from enum import Enum
+from pathlib import Path
+from threading import Lock
+from typing import Any
+
+from google import genai
+from google.genai import types
+
+from core import costs
+from settings import settings
+
+logger = logging.getLogger("video_factory")
+
+# ---------------------------------------------------------------------------
+# Fixture cache
+# ---------------------------------------------------------------------------
+
+FIXTURES_DIR = Path(".fixtures")
+
+
+class CacheMode(Enum):
+    OFF = "off"
+    RECORD = "record"
+    REPLAY = "replay"
+
+
+_mode = CacheMode.OFF
+_channel_slug: str = ""
+
+
+def set_mode(mode: str, channel_slug: str = "") -> None:
+    """Set cache mode globally. Called from factory.py CLI."""
+    global _mode, _channel_slug
+    _mode = CacheMode(mode)
+    _channel_slug = channel_slug
+    if _mode != CacheMode.OFF:
+        logger.info(f"Fixture cache: {_mode.value} (channel={channel_slug})")
+
+
+def get_mode() -> CacheMode:
+    return _mode
+
+
+def _cache_dir(category: str) -> Path:
+    base = FIXTURES_DIR / _channel_slug if _channel_slug else FIXTURES_DIR
+    return base / category
+
+
+def _cache_key(*args: Any) -> str:
+    """SHA-256 hash of serialized arguments."""
+    raw = json.dumps(args, sort_keys=True, default=str)
+    return hashlib.sha256(raw.encode()).hexdigest()[:16]
+
+
+def _replay_service_and_model(fn_name: str, kwargs: dict[str, Any]) -> tuple[str, str] | None:
+    explicit_model = kwargs.get("model")
+    mapping = {
+        "generate_text": ("generate_content", explicit_model or settings.gemini_primary_model),
+        "generate_json": ("generate_content", explicit_model or settings.gemini_primary_model),
+        "review_with_vision": ("generate_content", explicit_model or settings.gemini_review_model),
+        "generate_image_gemini": ("generate_content_image", explicit_model or settings.gemini_image_model),
+        "generate_speech": ("tts", explicit_model or settings.gemini_tts_model),
+    }
+    return mapping.get(fn_name)
+
+
+def _record_replay_event(fn_name: str, kwargs: dict[str, Any], cache_kind: str) -> None:
+    replay_info = _replay_service_and_model(fn_name, kwargs)
+    if replay_info is None:
+        return
+    service, model = replay_info
+    costs.record_cache_hit(
+        provider="fixture_cache",
+        service=service,
+        model=model,
+        operation=fn_name,
+        cache_kind=cache_kind,
+        notes=["Replay served from fixture cache."],
+    )
+
+
+# ── Decorators ────────────────────────────────────────────────────
+
+def cached_text(fn):
+    """Cache decorator for async functions returning str (text generation)."""
+    async def wrapper(*args, **kwargs):
+        if _mode == CacheMode.OFF:
+            return await fn(*args, **kwargs)
+
+        key = _cache_key(fn.__name__, args, kwargs)
+        cache_path = _cache_dir("text") / f"{key}.json"
+
+        if _mode == CacheMode.REPLAY:
+            if not cache_path.exists():
+                raise RuntimeError(f"Fixture cache miss: {fn.__name__} key={key}")
+            data = json.loads(cache_path.read_text(encoding="utf-8"))
+            logger.debug(f"[fixture] replay {fn.__name__} from {cache_path.name}")
+            _record_replay_event(fn.__name__, kwargs, "fixture_replay")
+            return data["result"]
+
+        # RECORD mode
+        result = await fn(*args, **kwargs)
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        cache_path.write_text(
+            json.dumps({"fn": fn.__name__, "key": key, "result": result}, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        logger.debug(f"[fixture] recorded {fn.__name__} → {cache_path.name}")
+        return result
+
+    wrapper.__name__ = fn.__name__
+    wrapper.__wrapped__ = fn
+    return wrapper
+
+
+def cached_json(fn):
+    """Cache decorator for async functions returning dict/list (JSON generation)."""
+    async def wrapper(*args, **kwargs):
+        if _mode == CacheMode.OFF:
+            return await fn(*args, **kwargs)
+
+        key = _cache_key(fn.__name__, args, kwargs)
+        cache_path = _cache_dir("text") / f"{key}.json"
+
+        if _mode == CacheMode.REPLAY:
+            if not cache_path.exists():
+                raise RuntimeError(f"Fixture cache miss: {fn.__name__} key={key}")
+            data = json.loads(cache_path.read_text(encoding="utf-8"))
+            logger.debug(f"[fixture] replay {fn.__name__} from {cache_path.name}")
+            _record_replay_event(fn.__name__, kwargs, "fixture_replay")
+            return data["result"]
+
+        result = await fn(*args, **kwargs)
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        cache_path.write_text(
+            json.dumps({"fn": fn.__name__, "key": key, "result": result}, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        logger.debug(f"[fixture] recorded {fn.__name__} → {cache_path.name}")
+        return result
+
+    wrapper.__name__ = fn.__name__
+    wrapper.__wrapped__ = fn
+    return wrapper
+
+
+def cached_file(category: str):
+    """Cache decorator for async functions that write to output_path and return Path|None."""
+    def decorator(fn):
+        async def wrapper(*args, **kwargs):
+            if _mode == CacheMode.OFF:
+                return await fn(*args, **kwargs)
+
+            # Extract output_path from args or kwargs
+            output_path = kwargs.get("output_path") or (args[1] if len(args) > 1 else None)
+            if output_path is None:
+                return await fn(*args, **kwargs)
+
+            # Build cache key from all args except output_path
+            cache_args = {k: v for k, v in kwargs.items() if k != "output_path"}
+            # Include positional args except output_path
+            pos_args = list(args)
+            if len(pos_args) > 1:
+                pos_args = [pos_args[0]] + pos_args[2:]  # skip output_path at index 1
+            key = _cache_key(fn.__name__, pos_args, cache_args)
+
+            suffix = Path(str(output_path)).suffix or f".{category}"
+            cache_path = _cache_dir(category) / f"{key}{suffix}"
+
+            if _mode == CacheMode.REPLAY:
+                if not cache_path.exists():
+                    raise RuntimeError(f"Fixture cache miss: {fn.__name__} key={key}")
+                output = Path(str(output_path))
+                output.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(cache_path, output)
+                logger.debug(f"[fixture] replay {fn.__name__} → {output.name}")
+                _record_replay_event(fn.__name__, kwargs, "fixture_replay")
+                return output
+
+            # RECORD mode
+            result = await fn(*args, **kwargs)
+            if result and Path(str(output_path)).exists():
+                cache_path.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(str(output_path), cache_path)
+                logger.debug(f"[fixture] recorded {fn.__name__} → {cache_path.name}")
+            return result
+
+        wrapper.__name__ = fn.__name__
+        wrapper.__wrapped__ = fn
+        return wrapper
+    return decorator
+
+
+def cached_http(fn):
+    """Cache decorator for async HTTP search functions returning bool + writing to output_path."""
+    async def wrapper(*args, **kwargs):
+        if _mode == CacheMode.OFF:
+            return await fn(*args, **kwargs)
+
+        key = _cache_key(fn.__name__, args[:1], {k: v for k, v in kwargs.items() if k not in ("client", "seen_hashes")})
+        meta_path = _cache_dir("http") / f"{key}.json"
+
+        # Extract output_path (2nd positional arg for search functions)
+        output_path = args[1] if len(args) > 1 else kwargs.get("output_path")
+
+        if _mode == CacheMode.REPLAY:
+            bin_path = _cache_dir("http_bin") / f"{key}{Path(str(output_path)).suffix}"
+            if not meta_path.exists() or not bin_path.exists():
+                raise RuntimeError(f"Fixture cache miss: {fn.__name__} key={key}")
+            data = json.loads(meta_path.read_text(encoding="utf-8"))
+            if output_path:
+                Path(str(output_path)).parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(bin_path, str(output_path))
+            logger.debug(f"[fixture] replay {fn.__name__} from {meta_path.name}")
+            return data["result"]
+
+        # RECORD mode
+        result = await fn(*args, **kwargs)
+        meta_path.parent.mkdir(parents=True, exist_ok=True)
+        meta_path.write_text(
+            json.dumps({"fn": fn.__name__, "key": key, "result": result}, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        if result and output_path and Path(str(output_path)).exists():
+            bin_dir = _cache_dir("http_bin")
+            bin_dir.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(str(output_path), bin_dir / f"{key}{Path(str(output_path)).suffix}")
+        logger.debug(f"[fixture] recorded {fn.__name__} → {meta_path.name}")
+        return result
+
+    wrapper.__name__ = fn.__name__
+    wrapper.__wrapped__ = fn
+    return wrapper
+
+
+# ---------------------------------------------------------------------------
+# AI trace report
+# ---------------------------------------------------------------------------
+
+_SLUG_RE = re.compile(r"[^a-z0-9]+")
+_TRACE_LOCK = Lock()
+_TRACE_WORKSPACE: Path | None = None
+_TRACE_COUNTER = itertools.count(1)
+
+
+@dataclass(frozen=True)
+class TraceRef:
+    """Reserved trace identity plus consolidated report location."""
+
+    trace_id: str
+    json_path: Path
+    html_rel_path: str
+    workspace: Path
+    run_id: str
+    channel: str
+    stage: str
+    operation: str
+    service: str
+    model: str
+
+
+def _slug(value: str) -> str:
+    cleaned = _SLUG_RE.sub("_", value.lower()).strip("_")
+    return cleaned or "trace"
+
+
+def _report_json_path(workspace: Path) -> Path:
+    return workspace / "reports" / "ai_trace_report.json"
+
+
+def _trace_index(trace_id: str) -> int:
+    prefix = trace_id.split("_", 1)[0]
+    return int(prefix) if prefix.isdigit() else 0
+
+
+def _ensure_counter(workspace: Path) -> None:
+    global _TRACE_WORKSPACE, _TRACE_COUNTER
+    if _TRACE_WORKSPACE == workspace:
+        return
+
+    highest = 0
+    report_path = _report_json_path(workspace)
+    if report_path.exists():
+        try:
+            report = json.loads(report_path.read_text(encoding="utf-8"))
+            for trace in report.get("traces", []):
+                highest = max(highest, _trace_index(str(trace.get("trace_id", ""))))
+        except Exception:
+            highest = 0
+
+    _TRACE_WORKSPACE = workspace
+    _TRACE_COUNTER = itertools.count(highest + 1)
+
+
+def reserve_trace(
+    *,
+    operation: str,
+    service: str,
+    model: str,
+) -> TraceRef | None:
+    """Reserve a stable trace id for the active workspace/run."""
+    tracker = costs.get_tracker()
+    if tracker is None:
+        return None
+
+    labels = costs.current_billing_labels(operation)
+    stage = labels.get("vf_stage", "unknown") or "unknown"
+    workspace = tracker.workspace
+
+    with _TRACE_LOCK:
+        _ensure_counter(workspace)
+        index = next(_TRACE_COUNTER)
+
+    trace_id = f"{index:04d}_{_slug(operation)}"
+    json_path = _report_json_path(workspace)
+    html_rel_path = f"pipeline.html#{trace_id}"
+    return TraceRef(
+        trace_id=trace_id,
+        json_path=json_path,
+        html_rel_path=html_rel_path,
+        workspace=workspace,
+        run_id=tracker.run_id,
+        channel=tracker.channel,
+        stage=stage,
+        operation=operation,
+        service=service,
+        model=model,
+    )
+
+
+def _default_report(trace_ref: TraceRef) -> dict[str, Any]:
+    return {
+        "run_id": trace_ref.run_id,
+        "channel": trace_ref.channel,
+        "generated_at": datetime.now().isoformat(),
+        "traces": [],
+    }
+
+
+def _load_report(trace_ref: TraceRef) -> dict[str, Any]:
+    if not trace_ref.json_path.exists():
+        return _default_report(trace_ref)
+    report = json.loads(trace_ref.json_path.read_text(encoding="utf-8"))
+    report.setdefault("traces", [])
+    report.setdefault("run_id", trace_ref.run_id)
+    report.setdefault("channel", trace_ref.channel)
+    return report
+
+
+def _upsert_trace(report: dict[str, Any], payload: dict[str, Any]) -> None:
+    traces = report.setdefault("traces", [])
+    trace_id = payload["trace_id"]
+    for index, trace in enumerate(traces):
+        if trace.get("trace_id") == trace_id:
+            traces[index] = payload
+            break
+    else:
+        traces.append(payload)
+        traces.sort(key=lambda item: _trace_index(str(item.get("trace_id", ""))))
+    report["generated_at"] = datetime.now().isoformat()
+
+
+def _metadata_rows(trace: dict[str, Any]) -> str:
+    rows = []
+    for label, key in [
+        ("Trace ID", "trace_id"),
+        ("Stage", "stage"),
+        ("Operation", "operation"),
+        ("Service", "service"),
+        ("Model", "model"),
+        ("Started At", "started_at"),
+        ("Duration", "duration_seconds"),
+        ("Status", "status"),
+    ]:
+        value = trace.get(key, "")
+        if value == "":
+            continue
+        rows.append(
+            f"<tr><th>{html.escape(label)}</th><td>{html.escape(str(value))}</td></tr>"
+        )
+    return "".join(rows)
+
+
+def _block(title: str, content: str) -> str:
+    if not content:
+        return ""
+    return (
+        f"<section class=\"trace-block\"><h3>{html.escape(title)}</h3>"
+        f"<pre>{html.escape(content)}</pre></section>"
+    )
+
+
+def _trace_card(trace: dict[str, Any]) -> str:
+    request = trace.get("request", {})
+    response = trace.get("response", {})
+    response_json = response.get("json")
+    response_json_text = (
+        json.dumps(response_json, ensure_ascii=False, indent=2)
+        if response_json is not None else ""
+    )
+    request_meta = {
+        key: value
+        for key, value in request.items()
+        if key not in {"system_instruction", "prompt"}
+    }
+    response_meta = {
+        key: value
+        for key, value in response.items()
+        if key not in {"text", "json", "error"}
+    }
+    status = str(trace.get("status", "ok"))
+    trace_id = str(trace.get("trace_id", ""))
+    return f"""
+<details class="trace-card" id="{html.escape(trace_id, quote=True)}">
+  <summary class="trace-card-header">
+    <h2>{html.escape(trace_id)}</h2>
+    <span class="pill pill-{html.escape(status, quote=True)}">{html.escape(status)}</span>
+  </summary>
+  <div class="trace-card-body">
+    <table>{_metadata_rows(trace)}</table>
+    {_block("Request Meta", json.dumps(request_meta, ensure_ascii=False, indent=2) if request_meta else "")}
+    {_block("System Instruction", request.get("system_instruction", ""))}
+    {_block("Prompt", request.get("prompt", ""))}
+    {_block("Response Meta", json.dumps(response_meta, ensure_ascii=False, indent=2) if response_meta else "")}
+    {_block("Response Text", response.get("text", ""))}
+    {_block("Response JSON", response_json_text)}
+    {_block("Error", response.get("error", ""))}
+  </div>
+</details>
+"""
+
+
+def render_embedded_html(report: dict[str, Any]) -> str:
+    traces = report.get("traces", [])
+    if not traces:
+        return '<p class="artifact-empty">No AI traces captured for this run.</p>'
+    nav_items = []
+    cards = []
+    for trace in traces:
+        trace_id = str(trace.get("trace_id", "trace"))
+        stage = str(trace.get("stage", "unknown"))
+        operation = str(trace.get("operation", "unknown"))
+        status = str(trace.get("status", "ok"))
+        nav_items.append(
+            "<a class=\"trace-link\" href=\"#"
+            f"{html.escape(trace_id, quote=True)}\">"
+            f"{html.escape(trace_id)}"
+            f" <span>{html.escape(stage)} / {html.escape(operation)} / {html.escape(status)}</span>"
+            "</a>"
+        )
+        cards.append(_trace_card(trace))
+
+    return f"""
+<div class="trace-report-meta">
+  Run: {html.escape(str(report.get("run_id", "")))} |
+  Channel: {html.escape(str(report.get("channel", "")))} |
+  Generated: {html.escape(str(report.get("generated_at", "")))} |
+  Calls: {len(traces)}
+</div>
+<nav class="trace-nav">
+  {"".join(nav_items)}
+</nav>
+<div class="trace-report-cards">
+  {"".join(cards)}
+</div>
+"""
+
+
+def load_report(report_path: Path) -> dict[str, Any] | None:
+    if not report_path.exists():
+        return None
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    report.setdefault("traces", [])
+    return report
+
+
+def write_trace(trace_ref: TraceRef, payload: dict[str, Any]) -> None:
+    """Upsert one trace into the consolidated JSON report."""
+    with _TRACE_LOCK:
+        report = _load_report(trace_ref)
+        _upsert_trace(report, payload)
+        trace_ref.json_path.parent.mkdir(parents=True, exist_ok=True)
+        trace_ref.json_path.write_text(
+            json.dumps(report, ensure_ascii=False, indent=2, default=str),
+            encoding="utf-8",
+        )
+
+
+def update_trace(trace_ref: TraceRef, patch: dict[str, Any]) -> None:
+    """Update one trace entry inside the consolidated report."""
+    with _TRACE_LOCK:
+        if not trace_ref.json_path.exists():
+            return
+        report = _load_report(trace_ref)
+        for trace in report.get("traces", []):
+            if trace.get("trace_id") == trace_ref.trace_id:
+                _deep_merge(trace, patch)
+                report["generated_at"] = datetime.now().isoformat()
+                trace_ref.json_path.write_text(
+                    json.dumps(report, ensure_ascii=False, indent=2, default=str),
+                    encoding="utf-8",
+                )
+                return
+
+
+def base_payload(
+    trace_ref: TraceRef,
+    *,
+    started_at: datetime,
+    duration_seconds: float | None = None,
+    status: str = "ok",
+) -> dict[str, Any]:
+    return {
+        "trace_id": trace_ref.trace_id,
+        "run_id": trace_ref.run_id,
+        "channel": trace_ref.channel,
+        "stage": trace_ref.stage,
+        "operation": trace_ref.operation,
+        "service": trace_ref.service,
+        "model": trace_ref.model,
+        "started_at": started_at.isoformat(),
+        "duration_seconds": round(duration_seconds, 3) if duration_seconds is not None else None,
+        "status": status,
+        "request": {},
+        "response": {},
+    }
+
+
+def _deep_merge(target: dict[str, Any], patch: dict[str, Any]) -> None:
+    for key, value in patch.items():
+        if key in target and isinstance(target[key], dict) and isinstance(value, dict):
+            _deep_merge(target[key], value)
+        else:
+            target[key] = value
+
+
+# ---------------------------------------------------------------------------
+# Shared client singleton
+# ---------------------------------------------------------------------------
+
+_client: genai.Client | None = None
+
+
+def _get_client() -> genai.Client:
+    global _client
+    if _client is None:
+        _client = genai.Client(
+            vertexai=True,
+            project=settings.google_project_id,
+            location=settings.google_cloud_location,
+        )
+    return _client
+
+
+def _trace_suffix(trace_ref: TraceRef | None) -> str:
+    return f' trace={trace_ref.html_rel_path}' if trace_ref else ""
+
+
+async def _generate_text_response(
+    prompt: str,
+    *,
+    system_instruction: str = "",
+    model: str | None = None,
+    temperature: float = 1.0,
+    max_output_tokens: int = 8192,
+    response_mime_type: str | None = None,
+    operation_label: str | None = None,
+) -> tuple[str, TraceRef | None]:
+    """Generate text with Gemini and return raw text plus trace reference."""
+    client = _get_client()
+    model = model or settings.gemini_primary_model
+    operation = operation_label or "generate_text"
+    trace_ref = reserve_trace(
+        operation=operation,
+        service="generate_content",
+        model=model,
+    )
+
+    prompt_preview = prompt[:80].replace("\n", " ")
+    logger.info(
+        f"[gemini] generate_text model={model} "
+        f'max_tokens={max_output_tokens} prompt="{prompt_preview}…" ({len(prompt)} chars)'
+        f"{_trace_suffix(trace_ref)}"
+    )
+
+    config = types.GenerateContentConfig(
+        temperature=temperature,
+        max_output_tokens=max_output_tokens,
+    )
+    if system_instruction:
+        config.system_instruction = system_instruction
+    if response_mime_type:
+        config.response_mime_type = response_mime_type
+    labels = costs.current_billing_labels(operation)
+    if labels:
+        config.labels = labels
+
+    started_at = datetime.now()
+    t0 = time.perf_counter()
+    try:
+        response = await client.aio.models.generate_content(
+            model=model,
+            contents=prompt,
+            config=config,
+        )
+    except Exception as exc:
+        elapsed = time.perf_counter() - t0
+        if trace_ref:
+            payload = base_payload(
+                trace_ref,
+                started_at=started_at,
+                duration_seconds=elapsed,
+                status="error",
+            )
+            payload["request"] = {
+                "system_instruction": system_instruction,
+                "prompt": prompt,
+                "temperature": temperature,
+                "max_output_tokens": max_output_tokens,
+                "response_mime_type": response_mime_type,
+            }
+            payload["response"] = {
+                "error": str(exc),
+            }
+            write_trace(trace_ref, payload)
+        raise
+
+    elapsed = time.perf_counter() - t0
+    usage = response.usage_metadata
+    if usage is not None:
+        costs.record_generate_content_cost(
+            model=model,
+            usage_metadata=usage,
+            operation=operation,
+        )
+    prompt_tokens = getattr(usage, "prompt_token_count", 0) or 0
+    output_tokens = getattr(usage, "candidates_token_count", 0) or 0
+    logger.info(
+        f"[gemini] generate_text done — {elapsed:.1f}s, "
+        f"{prompt_tokens} in + {output_tokens} out tokens, "
+        f"{len(response.text)} chars"
+        f"{_trace_suffix(trace_ref)}"
+    )
+    if trace_ref:
+        payload = base_payload(
+            trace_ref,
+            started_at=started_at,
+            duration_seconds=elapsed,
+            status="ok",
+        )
+        payload["request"] = {
+            "system_instruction": system_instruction,
+            "prompt": prompt,
+            "temperature": temperature,
+            "max_output_tokens": max_output_tokens,
+            "response_mime_type": response_mime_type,
+        }
+        payload["response"] = {
+            "text": response.text,
+            "prompt_token_count": prompt_tokens or None,
+            "output_token_count": output_tokens or None,
+        }
+        write_trace(trace_ref, payload)
+    return response.text, trace_ref
+
+
+# ---------------------------------------------------------------------------
+# Gemini — text generation
+# ---------------------------------------------------------------------------
+
+@cached_text
+async def generate_text(
+    prompt: str,
+    *,
+    system_instruction: str = "",
+    model: str | None = None,
+    temperature: float = 1.0,
+    max_output_tokens: int = 8192,
+    response_mime_type: str | None = None,
+    operation_label: str | None = None,
+) -> str:
+    """Generate text with Gemini. Returns the raw text response."""
+    text, _trace_ref = await _generate_text_response(
+        prompt,
+        system_instruction=system_instruction,
+        model=model,
+        temperature=temperature,
+        max_output_tokens=max_output_tokens,
+        response_mime_type=response_mime_type,
+        operation_label=operation_label,
+    )
+    return text
+
+
+async def generate_json(
+    prompt: str,
+    *,
+    system_instruction: str = "",
+    model: str | None = None,
+    temperature: float = 1.0,
+    max_output_tokens: int = 8192,
+    operation_label: str | None = None,
+) -> dict | list:
+    """Generate structured JSON from Gemini."""
+    text, trace_ref = await _generate_text_response(
+        prompt,
+        system_instruction=system_instruction,
+        model=model,
+        temperature=temperature,
+        max_output_tokens=max_output_tokens,
+        response_mime_type="application/json",
+        operation_label=operation_label or "generate_json",
+    )
+    parsed = json.loads(text)
+    if trace_ref:
+        update_trace(trace_ref, {"response": {"json": parsed}})
+    return parsed
+
+
+# ---------------------------------------------------------------------------
+# Gemini — vision review
+# ---------------------------------------------------------------------------
+
+@cached_json
+async def review_with_vision(
+    prompt: str,
+    image_paths: list[Path],
+    *,
+    system_instruction: str = "",
+    model: str | None = None,
+    operation_label: str | None = None,
+) -> dict:
+    """Send images + prompt to Gemini for vision-based review. Returns parsed JSON."""
+    client = _get_client()
+    model = model or settings.gemini_review_model
+    operation = operation_label or "review_with_vision"
+    trace_ref = reserve_trace(
+        operation=operation,
+        service="generate_content",
+        model=model,
+    )
+
+    prompt_preview = prompt[:80].replace("\n", " ")
+    logger.info(
+        f"[gemini] review_with_vision model={model} "
+        f'images={len(image_paths)} prompt="{prompt_preview}…" ({len(prompt)} chars)'
+        f"{_trace_suffix(trace_ref)}"
+    )
+
+    parts: list[types.Part] = []
+    for img_path in image_paths:
+        img_bytes = img_path.read_bytes()
+        suffix = img_path.suffix.lower()
+        mime = {
+            ".png": "image/png",
+            ".jpg": "image/jpeg",
+            ".jpeg": "image/jpeg",
+            ".webp": "image/webp",
+        }.get(suffix, "image/jpeg")
+        parts.append(types.Part.from_bytes(data=img_bytes, mime_type=mime))
+
+    parts.append(types.Part.from_text(text=prompt))
+
+    config = types.GenerateContentConfig(
+        temperature=0.3,
+        max_output_tokens=8192,
+        response_mime_type="application/json",
+    )
+    if system_instruction:
+        config.system_instruction = system_instruction
+    labels = costs.current_billing_labels(operation)
+    if labels:
+        config.labels = labels
+
+    started_at = datetime.now()
+    t0 = time.perf_counter()
+    try:
+        response = await client.aio.models.generate_content(
+            model=model,
+            contents=parts,
+            config=config,
+        )
+    except Exception as exc:
+        elapsed = time.perf_counter() - t0
+        if trace_ref:
+            payload = base_payload(
+                trace_ref,
+                started_at=started_at,
+                duration_seconds=elapsed,
+                status="error",
+            )
+            payload["request"] = {
+                "system_instruction": system_instruction,
+                "prompt": prompt,
+                "image_paths": [str(path) for path in image_paths],
+                "response_mime_type": "application/json",
+            }
+            payload["response"] = {"error": str(exc)}
+            write_trace(trace_ref, payload)
+        raise
+    elapsed = time.perf_counter() - t0
+    usage = response.usage_metadata
+    if usage is not None:
+        costs.record_generate_content_cost(
+            model=model,
+            usage_metadata=usage,
+            operation=operation,
+        )
+    prompt_tokens = getattr(usage, "prompt_token_count", 0) or 0
+    output_tokens = getattr(usage, "candidates_token_count", 0) or 0
+    logger.info(
+        f"[gemini] review_with_vision done — {elapsed:.1f}s, "
+        f"{prompt_tokens} in + {output_tokens} out tokens"
+        f"{_trace_suffix(trace_ref)}"
+    )
+    text = response.text
+    parsed_json = None
+    repaired = False
+    try:
+        parsed_json = json.loads(text)
+    except json.JSONDecodeError as original_err:
+        # Attempt basic repair for truncated JSON responses
+        repaired_text = text.strip()
+
+        # Strip markdown fences if present
+        if repaired_text.startswith("```"):
+            first_nl = repaired_text.find("\n")
+            repaired_text = repaired_text[first_nl + 1 :] if first_nl != -1 else repaired_text[3:]
+            if repaired_text.endswith("```"):
+                repaired_text = repaired_text[:-3]
+            repaired_text = repaired_text.strip()
+
+        # Close unterminated string
+        if repaired_text.count('"') % 2 != 0:
+            repaired_text += '"'
+
+        # Close open brackets/braces
+        for open_ch, close_ch in [("[", "]"), ("{", "}")]:
+            deficit = repaired_text.count(open_ch) - repaired_text.count(close_ch)
+            if deficit > 0:
+                repaired_text += close_ch * deficit
+
+        try:
+            logger.warning("Repaired truncated JSON from vision review")
+            parsed_json = json.loads(repaired_text)
+            repaired = True
+        except json.JSONDecodeError:
+            raise original_err
+    if trace_ref:
+        payload = base_payload(
+            trace_ref,
+            started_at=started_at,
+            duration_seconds=elapsed,
+            status="ok",
+        )
+        payload["request"] = {
+            "system_instruction": system_instruction,
+            "prompt": prompt,
+            "image_paths": [str(path) for path in image_paths],
+            "response_mime_type": "application/json",
+        }
+        payload["response"] = {
+            "text": text,
+            "json": parsed_json,
+            "json_repaired": repaired,
+            "prompt_token_count": prompt_tokens or None,
+            "output_token_count": output_tokens or None,
+        }
+        write_trace(trace_ref, payload)
+    return parsed_json
+
+
+# ---------------------------------------------------------------------------
+# Gemini — image generation (Nano Banana)
+# ---------------------------------------------------------------------------
+
+@cached_file("image")
+async def generate_image_gemini(
+    prompt: str,
+    output_path: Path,
+    *,
+    model: str | None = None,
+    reference_image: Path | None = None,
+    aspect_ratio: str = "16:9",
+    image_size: str = "1K",
+    operation_label: str | None = None,
+) -> Path | None:
+    """Generate an image with Gemini (Nano Banana) and save to output_path.
+
+    If reference_image is provided, it is sent as context so the model can
+    enhance or riff on it rather than generating from scratch.
+
+    Returns the path on success, None on failure.
+    """
+    client = _get_client()
+    model = model or settings.gemini_image_model
+    operation = operation_label or "generate_image_gemini"
+    trace_ref = reserve_trace(
+        operation=operation,
+        service="generate_content_image",
+        model=model,
+    )
+
+    prompt_preview = prompt[:80].replace("\n", " ")
+    logger.info(
+        f"[gemini] generate_image_gemini model={model} "
+        f"ref={'yes' if reference_image else 'no'} "
+        f'prompt="{prompt_preview}…" ({len(prompt)} chars)'
+        f"{_trace_suffix(trace_ref)}"
+    )
+
+    contents: list = []
+    if reference_image and reference_image.exists():
+        img_bytes = reference_image.read_bytes()
+        suffix = reference_image.suffix.lower()
+        mime = {
+            ".png": "image/png",
+            ".jpg": "image/jpeg",
+            ".jpeg": "image/jpeg",
+            ".webp": "image/webp",
+        }.get(suffix, "image/jpeg")
+        contents.append(types.Part.from_bytes(data=img_bytes, mime_type=mime))
+    contents.append(prompt)
+
+    started_at = datetime.now()
+    try:
+        t0 = time.perf_counter()
+        response = await client.aio.models.generate_content(
+            model=model,
+            contents=contents,
+            config=types.GenerateContentConfig(
+                response_modalities=["IMAGE", "TEXT"],
+                image_config=types.ImageConfig(
+                    aspect_ratio=aspect_ratio,
+                    image_size=image_size,
+                ),
+                labels=costs.current_billing_labels(operation),
+            ),
+        )
+        elapsed = time.perf_counter() - t0
+        generated_images = 0
+
+        for part in response.candidates[0].content.parts:
+            if part.inline_data and part.inline_data.mime_type.startswith("image/"):
+                output_path.parent.mkdir(parents=True, exist_ok=True)
+                output_path.write_bytes(part.inline_data.data)
+                generated_images += 1
+                usage = getattr(response, "usage_metadata", None)
+                if usage is not None:
+                    costs.record_generate_content_cost(
+                        model=model,
+                        usage_metadata=usage,
+                        operation=operation,
+                        service="generate_content_image",
+                        generated_images=generated_images,
+                    )
+                logger.info(
+                    f"[gemini] generate_image_gemini done — {elapsed:.1f}s → {output_path.name}"
+                    f"{_trace_suffix(trace_ref)}"
+                )
+                if trace_ref:
+                    payload = base_payload(
+                        trace_ref,
+                        started_at=started_at,
+                        duration_seconds=elapsed,
+                        status="ok",
+                    )
+                    payload["request"] = {
+                        "prompt": prompt,
+                        "reference_image": str(reference_image) if reference_image else None,
+                        "aspect_ratio": aspect_ratio,
+                        "image_size": image_size,
+                        "output_path": str(output_path),
+                    }
+                    payload["response"] = {
+                        "generated_images": generated_images,
+                        "output_path": str(output_path),
+                    }
+                    write_trace(trace_ref, payload)
+                return output_path
+
+        usage = getattr(response, "usage_metadata", None)
+        if usage is not None:
+            costs.record_generate_content_cost(
+                model=model,
+                usage_metadata=usage,
+                operation=operation,
+                service="generate_content_image",
+                generated_images=generated_images or None,
+            )
+        logger.warning(
+            f"[gemini] generate_image_gemini done — {elapsed:.1f}s, no image returned"
+            f"{_trace_suffix(trace_ref)}"
+        )
+        if trace_ref:
+            payload = base_payload(
+                trace_ref,
+                started_at=started_at,
+                duration_seconds=elapsed,
+                status="empty",
+            )
+            payload["request"] = {
+                "prompt": prompt,
+                "reference_image": str(reference_image) if reference_image else None,
+                "aspect_ratio": aspect_ratio,
+                "image_size": image_size,
+                "output_path": str(output_path),
+            }
+            payload["response"] = {
+                "generated_images": generated_images,
+            }
+            write_trace(trace_ref, payload)
+        return None
+
+    except Exception as e:
+        if trace_ref:
+            payload = base_payload(
+                trace_ref,
+                started_at=started_at,
+                status="error",
+            )
+            payload["request"] = {
+                "prompt": prompt,
+                "reference_image": str(reference_image) if reference_image else None,
+                "aspect_ratio": aspect_ratio,
+                "image_size": image_size,
+                "output_path": str(output_path),
+            }
+            payload["response"] = {"error": str(e)}
+            write_trace(trace_ref, payload)
+        logger.error(f"Gemini image generation failed: {e}")
+        return None
+
+
+# ---------------------------------------------------------------------------
+# TTS — speech generation
+# ---------------------------------------------------------------------------
+
+@cached_file("speech")
+async def generate_speech(
+    text: str,
+    output_path: Path,
+    *,
+    voice_prompt: str = "Read this aloud in a warm, clear narrator voice.",
+    language: str = "en-US",
+    voice_name: str = "Charon",
+    model: str | None = None,
+    operation_label: str | None = None,
+) -> Path | None:
+    """Generate speech audio from text using Gemini TTS.
+
+    The voice characteristics are controlled via the voice_prompt — describe
+    the voice you want (tone, pace, emotion, accent). The base voice is
+    selected via voice_name (e.g. "Charon", "Kore", "Fenrir", "Aoede").
+
+    Returns the output path on success, None on failure.
+    """
+    client = _get_client()
+    model = model or settings.gemini_tts_model
+    operation = operation_label or "generate_speech"
+    trace_ref = reserve_trace(
+        operation=operation,
+        service="tts",
+        model=model,
+    )
+
+    word_count = len(text.split())
+    logger.info(
+        f"[tts] generate_speech model={model} "
+        f"voice={voice_name} lang={language} text={word_count} words"
+        f"{_trace_suffix(trace_ref)}"
+    )
+
+    full_prompt = f"{voice_prompt}\n\nText to read ({language}):\n{text}"
+
+    started_at = datetime.now()
+    try:
+        t0 = time.perf_counter()
+        response = await client.aio.models.generate_content(
+            model=model,
+            contents=full_prompt,
+            config=types.GenerateContentConfig(
+                response_modalities=["AUDIO"],
+                labels=costs.current_billing_labels(operation),
+                speech_config=types.SpeechConfig(
+                    voice_config=types.VoiceConfig(
+                        prebuilt_voice_config=types.PrebuiltVoiceConfig(
+                            voice_name=voice_name,
+                        )
+                    )
+                ),
+            ),
+        )
+        elapsed = time.perf_counter() - t0
+
+        # Extract audio data from response
+        audio_data = None
+        sample_rate = 24000  # default
+        for part in response.candidates[0].content.parts:
+            if part.inline_data and part.inline_data.mime_type.startswith("audio/"):
+                audio_data = part.inline_data.data
+                # Parse sample rate from mime type (e.g. "audio/L16;codec=pcm;rate=24000")
+                mime = part.inline_data.mime_type
+                if "rate=" in mime:
+                    sample_rate = int(mime.split("rate=")[1].split(";")[0])
+                break
+
+        if audio_data is None:
+            logger.warning("TTS returned no audio data")
+            return None
+
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+
+        # Gemini TTS returns raw PCM L16 (16-bit signed, mono).
+        # Wrap it in a proper WAV header so FFmpeg/MoviePy can read it.
+        wav_path = output_path.with_suffix(".wav")
+        with wave.open(str(wav_path), "wb") as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)  # 16-bit = 2 bytes
+            wf.setframerate(sample_rate)
+            wf.writeframes(audio_data)
+
+        usage = getattr(response, "usage_metadata", None)
+        prompt_tokens = getattr(usage, "prompt_token_count", 0) or 0
+        audio_seconds = len(audio_data) / (sample_rate * 2)
+        costs.record_tts_cost(
+            model=model,
+            prompt_tokens=prompt_tokens,
+            audio_seconds=audio_seconds,
+            operation=operation,
+        )
+        logger.info(
+            f"[tts] generate_speech done — {elapsed:.1f}s → {wav_path.name}"
+            f"{_trace_suffix(trace_ref)}"
+        )
+        if trace_ref:
+            payload = base_payload(
+                trace_ref,
+                started_at=started_at,
+                duration_seconds=elapsed,
+                status="ok",
+            )
+            payload["request"] = {
+                "voice_prompt": voice_prompt,
+                "language": language,
+                "voice_name": voice_name,
+                "prompt": full_prompt,
+                "output_path": str(wav_path),
+            }
+            payload["response"] = {
+                "output_path": str(wav_path),
+                "prompt_token_count": prompt_tokens or None,
+                "audio_seconds": round(audio_seconds, 3),
+                "sample_rate": sample_rate,
+            }
+            write_trace(trace_ref, payload)
+        return wav_path
+
+    except Exception as e:
+        if trace_ref:
+            payload = base_payload(
+                trace_ref,
+                started_at=started_at,
+                status="error",
+            )
+            payload["request"] = {
+                "voice_prompt": voice_prompt,
+                "language": language,
+                "voice_name": voice_name,
+                "prompt": full_prompt,
+                "output_path": str(output_path.with_suffix(".wav")),
+            }
+            payload["response"] = {"error": str(e)}
+            write_trace(trace_ref, payload)
+        logger.error(f"TTS generation failed: {e}")
+        return None

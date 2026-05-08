@@ -1,0 +1,83 @@
+{
+  "version": "2026-04-10",
+  "effective_date": "2026-04-10",
+  "entries": [
+    {
+      "service": "generate_content",
+      "model": "gemini-3.1-pro-preview",
+      "input_rate_usd_per_1m_tokens": 2.0,
+      "input_rate_long_context_usd_per_1m_tokens": 4.0,
+      "cached_input_rate_usd_per_1m_tokens": 0.2,
+      "cached_input_rate_long_context_usd_per_1m_tokens": 0.4,
+      "output_text_rate_usd_per_1m_tokens": 12.0,
+      "output_text_rate_long_context_usd_per_1m_tokens": 18.0,
+      "reconciliation_supported": true,
+      "source_url": "https://cloud.google.com/vertex-ai/generative-ai/pricing"
+    },
+    {
+      "service": "generate_content",
+      "model": "gemini-3-flash-preview",
+      "input_rate_usd_per_1m_tokens": 0.5,
+      "input_rate_long_context_usd_per_1m_tokens": 0.5,
+      "cached_input_rate_usd_per_1m_tokens": 0.05,
+      "cached_input_rate_long_context_usd_per_1m_tokens": 0.05,
+      "output_text_rate_usd_per_1m_tokens": 3.0,
+      "output_text_rate_long_context_usd_per_1m_tokens": 3.0,
+      "reconciliation_supported": true,
+      "source_url": "https://cloud.google.com/vertex-ai/generative-ai/pricing"
+    },
+    {
+      "service": "generate_content_image",
+      "model": "gemini-3-pro-image-preview",
+      "input_rate_usd_per_1m_tokens": 2.0,
+      "output_text_rate_usd_per_1m_tokens": 12.0,
+      "output_image_rate_usd_per_image": 0.134,
+      "reconciliation_supported": true,
+      "source_url": "https://cloud.google.com/vertex-ai/generative-ai/pricing",
+      "notes": [
+        "Generated-image estimate assumes the 1K/2K output-image price published for Gemini 3 Pro Image."
+      ]
+    },
+    {
+      "service": "generate_content_image",
+      "model": "gemini-3.1-flash-image-preview",
+      "input_rate_usd_per_1m_tokens": 0.5,
+      "output_text_rate_usd_per_1m_tokens": 60.0,
+      "output_image_rate_usd_per_image": 0.067,
+      "reconciliation_supported": true,
+      "source_url": "https://ai.google.dev/gemini-api/docs/pricing",
+      "notes": [
+        "Per-image rate is the published 1K paid-tier price."
+      ]
+    },
+    {
+      "service": "tts",
+      "model": "gemini-2.5-pro-tts",
+      "input_rate_usd_per_1m_tokens": 1.0,
+      "output_audio_rate_usd_per_1m_tokens": 20.0,
+      "audio_tokens_per_second": 25,
+      "reconciliation_supported": true,
+      "source_url": "https://cloud.google.com/text-to-speech/pricing"
+    },
+    {
+      "service": "tts",
+      "model": "gemini-2.5-flash-tts",
+      "input_rate_usd_per_1m_tokens": 0.5,
+      "output_audio_rate_usd_per_1m_tokens": 10.0,
+      "audio_tokens_per_second": 25,
+      "reconciliation_supported": true,
+      "source_url": "https://cloud.google.com/text-to-speech/pricing"
+    },
+    {
+      "service": "speech_to_text",
+      "model": "long",
+      "rate_usd_per_minute": 0.016,
+      "billed_seconds_rounding": 1,
+      "reconciliation_supported": false,
+      "source_url": "https://cloud.google.com/speech-to-text/pricing",
+      "notes": [
+        "Speech-to-Text V2 bills successfully processed audio in one-second increments."
+      ]
+    }
+  ]
+}

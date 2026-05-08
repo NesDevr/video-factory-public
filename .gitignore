@@ -1,0 +1,37 @@
+.env
+.env.*
+!.env.example
+__pycache__/
+*.pyc
+.venv/
+venv/
+config/youtube_oauth/
+workspace/
+logs/
+data/
+data/topic_history.json
+*.mp4
+*.mp3
+*.raw
+.claude/
+.codex/
+.vscode/
+.pytest_cache/
+.fixtures/
+
+# Local generated caches
+.cache/
+.remotion/
+
+# Remotion / Node.js
+rendering/remotion/node_modules/
+rendering/remotion/dist/
+rendering/remotion/out/
+rendering/remotion/.remotion/
+rendering/remotion/public/_sections/
+rendering/remotion/public/_preview/
+rendering/remotion/public/preview_manifest.json
+
+# Local Codex scratch output
+.codex-preview-test.log
+.cleanup_stash/
