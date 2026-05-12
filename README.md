@@ -7,8 +7,6 @@ review reports, and cost traces.
 
 ![Remotion Studio preview](docs/screenshots/remotion_preview.png)
 
-![Sample output](docs/screenshots/sample_output.png)
-
 
 What it does:
 
