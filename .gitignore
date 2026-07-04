@@ -10,6 +10,12 @@ workspace/
 logs/
 data/
 data/topic_history.json
+config/channels/senior_health.json
+config/channels/finanzas_mx.json
+config/channels/memoria_vintage_mx.json
+config/channels/assets/senior_health_logo.png
+config/channels/assets/senior_health_watermark.png
+assets/channels/senior_health/
 *.mp4
 *.mp3
 *.raw

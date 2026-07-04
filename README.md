@@ -24,6 +24,11 @@ This public repo includes a generic `demo_channel` configuration. Production
 channel configs, generated workspaces, private research notes, API keys, and
 runtime media outputs are intentionally excluded.
 
+For local production use, private channel configs and assets can live beside the
+demo config under `config/channels/` and `assets/channels/`. The known private
+channel files are ignored by git so the public repo remains demo-safe.
+
+
 ## Architecture
 
 ```text
